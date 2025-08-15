@@ -6,4 +6,4 @@
 # -k uvicorn.workers.UvicornWorker: Tells Gunicorn to use Uvicorn for running an ASGI app (FastAPI).
 # main:app: Points to the 'app' instance in your 'main.py' file.
 # -b 0.0.0.0:$PORT: Binds the server to the host and port provided by Render's environment.
-gunicorn --timeout 120 -w 4 -k uvicorn.workers.UvicornWorker main:app -b 0.0.0.0:$PORT
+gunicorn --timeout 300 -w 4 -k uvicorn.workers.UvicornWorker main:app -b 0.0.0.0:$PORT
