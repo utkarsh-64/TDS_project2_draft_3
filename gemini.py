@@ -50,6 +50,7 @@ RULES:
 - The generated code must save data to the '{folder}' directory.
 - The code must also generate a '{folder}/metadata.txt' file containing dataframe info, column names, and the first few rows.
 - If the user provides an ANSWER_FORMAT, copy it verbatim into the metadata file. Otherwise, use "ANSWER_FORMAT: JSON".
+- Do NOT include 'sqlite3' in the libraries list, as it is a built-in Python library.
 - Respond ONLY with a valid JSON object matching this schema: {{"code": "...", "libraries": [...], "questions": [...]}}
 - Do NOT include explanations or any text outside the JSON response.
 """
@@ -104,6 +105,7 @@ RULES:
 - The code MUST save the final answer as a JSON file to '{folder}/result.json'.
 - The code must adhere to the 'ANSWER_FORMAT' specified in the metadata.
 - If visualizations are created, they must be saved as base64-encoded PNGs within the result JSON.
+- Do NOT include 'sqlite3' in the libraries list, as it is a built-in Python library.
 - Respond ONLY with a valid JSON object matching this schema: {{"code": "...", "libraries": [...]}}
 - Do NOT include explanations or any text outside the JSON response.
 """
