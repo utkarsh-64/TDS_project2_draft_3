@@ -10,7 +10,7 @@ if not api_key:
 
 genai.configure(api_key=api_key)
 
-MODEL_NAME = "gemini-2.5-pro"
+MODEL_NAME = "gemini-2.5-pro" # Using latest model for better performance
 
 # Give response in JSON format
 generation_config = genai.types.GenerationConfig(
@@ -26,8 +26,8 @@ async def get_chat_session(sessions_dict, session_id, system_prompt, model_name=
     if session_id not in sessions_dict:
         model = genai.GenerativeModel(
             model_name=model_name,
-            generation_config=generation_config,   # defaults for the whole chat
-            system_instruction=system_prompt       # put your system prompt here
+            generation_config=generation_config,
+            system_instruction=system_prompt
         )        
         chat = model.start_chat(history=[])
         sessions_dict[session_id] = chat    
@@ -36,7 +36,7 @@ async def get_chat_session(sessions_dict, session_id, system_prompt, model_name=
 # ------------------------
 # PARSE QUESTION FUNCTION
 # ------------------------
-async def parse_question_with_llm(question_text=None, uploaded_files=None, session_id="default_parse", retry_message=None, folder="uploads"):
+async def parse_question_with_llm(question_text=None, uploaded_files=None, db_schemas=None, session_id="default_parse", retry_message=None, folder="uploads"):
     """
     Parse question with persistent chat session.
     - If retry_message is provided, sends only that to continue conversation.
@@ -49,8 +49,9 @@ You must only:
 3. Extract the main questions the user is asking (without answering them).  
 
 Rules:
+- If database files (.db) are provided, their schemas will be included. You MUST use this schema to write correct SQL queries. Do not invent table or column names.
 - If no URLs are provided, read files from the "uploads" folder and create metadata.  
-- Always save the datasets in  {folder}.  
+- Always save the datasets in {folder}.  
 - Record the paths and short descriptions of stored data files in {folder}/metadata.txt.  
 - Include in {folder}/metadata.txt:
     • Output of df.info()  
@@ -80,13 +81,23 @@ STRICT PROHIBITIONS:
 - Do not change the JSON schema.  
 """
 
-
-    chat =await get_chat_session(parse_chat_sessions, session_id, SYSTEM_PROMPT)
+    chat = await get_chat_session(parse_chat_sessions, session_id, SYSTEM_PROMPT)
 
     if retry_message:
-        # Only send error/retry message
-        prompt = f"Previous code failed with: <error_snippet>{retry_message}</error_snippet>. Please fix the code."
+        prompt = f"Previous code failed with: <error_snippet>{retry_message}</error_snippet>. Please fix the code. If the error is a database error, pay close attention to the provided schema."
     else:
+        # --- MODIFICATION: Add db_schemas to the prompt ---
+        db_schema_prompt_part = ""
+        if db_schemas:
+            db_schema_prompt_part = f'''
+Database Schemas:
+<database_schemas>
+{json.dumps(db_schemas, indent=2)}
+</database_schemas>
+IMPORTANT: You MUST use this schema to write correct SQL queries. Do not query tables or columns that are not listed here.
+'''
+        # --- END MODIFICATION ---
+
         prompt = f"""
 Question:
 <questions_file_output>
@@ -97,14 +108,13 @@ Uploaded files:
 <uploaded_files>
 "{uploaded_files}"
 </uploaded_files>
-
+{db_schema_prompt_part}
 Your task:
 Generate Python code that collects the data needed for the question, saves it to {folder}/data.csv,  
 and generates {folder}/metadata.txt with the required metadata.  
 Do not answer the question — only collect the data and metadata.  
 """
 
-    # Path to the file
     file_path = os.path.join(folder, "metadata.txt")
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
     if not os.path.exists(file_path):
@@ -122,7 +132,6 @@ async def answer_with_data(question_text=None, session_id="default_answer", retr
     Answer analytical question with persistent chat session.
     - If retry_message is provided, sends only that to continue conversation.
     """
-    # Reading metadata file
     metadata_path = os.path.join(folder, "metadata.txt")
     with open(metadata_path, "r") as file:
         metadata = file.read()
@@ -139,12 +148,12 @@ Answer Format compliance:
 - Read the "ANSWER_FORMAT" from {folder}/metadata.txt (copied verbatim from questions.txt).
 - If ANSWER_FORMAT is present, the final JSON in {folder}/result.json MUST STRICTLY MATCH it:
   • Preserve key names, required fields, types, nesting, and key order if specified.
-  • Fill missing required keys with suitable  answers following structures as appropriate (do not invent new keys).
+  • Fill missing required keys with suitable answers following structures as appropriate (do not invent new keys).
 - If ANSWER_FORMAT is "NONE", default to a minimal JSON object:
 - If you are unable to find the data then fill the JSON which random data in the specified format type.
   {{
-    "answer": random data matching the specified JSON type,
-    "images": random data matching the specified JSON type
+    "answer": "Could not determine answer from the data.",
+    "images": []
   }}
 
 Rules:
@@ -162,7 +171,7 @@ Output schema:
 }}
 """
 
-    chat =await get_chat_session(answer_chat_sessions, session_id, SYSTEM_PROMPT)
+    chat = await get_chat_session(answer_chat_sessions, session_id, SYSTEM_PROMPT)
 
     if retry_message:
         prompt = f"Previous code failed: <error_snippet>{retry_message}</error_snippet>. Please correct it."
@@ -191,7 +200,6 @@ Generate Python code that:
 Follow the schema exactly and return only valid JSON.
 """
 
-    # Path to the file
     file_path = os.path.join(folder, "result.json")
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
     if not os.path.exists(file_path):
