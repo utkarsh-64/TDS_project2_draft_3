@@ -8,7 +8,7 @@ import json
 import logging
 from fastapi.responses import HTMLResponse
 import difflib
-import aiofiles
+import sqlite3 # <-- Import sqlite3
 
 from task_engine import run_python_code
 from gemini import parse_question_with_llm, answer_with_data
@@ -23,6 +23,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- NEW HELPER FUNCTION TO GET DB SCHEMA ---
+def get_db_schema(db_path):
+    """Connects to a SQLite DB and extracts its schema."""
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = cursor.fetchall()
+        schema_info = {}
+        for table_tuple in tables:
+            table_name = table_tuple[0]
+            cursor.execute(f"PRAGMA table_info('{table_name}');")
+            columns = cursor.fetchall()
+            # Format: { 'table_name': ['col1 (type)', 'col2 (type)'] }
+            schema_info[table_name] = [f"{col[1]} ({col[2]})" for col in columns]
+        conn.close()
+        return schema_info
+    except Exception as e:
+        # Log the error, but don't crash the app
+        print(f"Error reading schema from {db_path}: {e}")
+        return {"error": f"Could not read schema from {db_path}: {e}"}
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
@@ -92,30 +113,27 @@ async def analyze(request: Request):
         else:
             saved_files[field_name] = value
 
-    # Fallback: If no questions.txt, use the first file as question
-    
-
     if question_text is None and saved_files:
         target_name = "question.txt"
         file_names = list(saved_files.keys())
-
-        # Find the closest matching filename
         closest_matches = difflib.get_close_matches(target_name, file_names, n=1, cutoff=0.6)
         if closest_matches:
             selected_file_key = closest_matches[0]
         else:
-            selected_file_key = next(iter(saved_files.keys()))  # fallback to first file
-
+            selected_file_key = next(iter(saved_files.keys()))
         selected_file_path = saved_files[selected_file_key]
-
         async with aiofiles.open(selected_file_path, "r") as f:
             question_text = await f.read()
 
-    
     logger.info("Step-2: File sent %s", saved_files)
 
-
-    # ✅ 4. Get code steps from LLM
+    # --- ADDITION: Extract schema from any .db files ---
+    db_schemas = {}
+    for file_name, file_path in saved_files.items():
+        if file_path.endswith(".db"):
+            schema = get_db_schema(file_path)
+            db_schemas[file_name] = schema
+    # --- END ADDITION ---
 
     max_attempts = 3
     attempt = 0
@@ -129,14 +147,13 @@ async def analyze(request: Request):
                 response = await parse_question_with_llm(
                     question_text=question_text,
                     uploaded_files=saved_files,
+                    db_schemas=db_schemas,  # <-- Pass the schema to the LLM
                     folder=request_folder,
                     session_id=request_id
                 )
             else:
                 response = await parse_question_with_llm(retry_message=retry_message, folder=request_folder, session_id=request_id)
-            # Check if response is a valid dict (parsed JSON)
             if isinstance(response, dict):
-                # Write to file
                 with open(llm_response_file_path, "a") as f:
                     result = response
                     result["comment"] = f"Step-3: Getting scrap code and metadata from llm. Tries count = %d {attempt}"
@@ -148,18 +165,13 @@ async def analyze(request: Request):
             logger.error("Step-3: Error in parsing the result. %s", retry_message)
         attempt += 1
 
-
     if not isinstance(response, dict):
         logger.error("Error: Could not get valid response from LLM after retries.")
         return JSONResponse({"message": "Error: Could not get valid response from LLM after retries."})
 
-
-
     logger.info("Step-3: Response from scrapping: %s", last_n_words(response))
 
-    # ✅ 5. Execute generated code safely. Also try and except block, for this is placed in task_engine.py file
     execution_result = await run_python_code(response["code"], response["libraries"], folder=request_folder)
-    # Write to file
    
     logger.info("Step-4: Execution result of the scrape code: %s", last_n_words(execution_result["output"]))
 
@@ -168,7 +180,8 @@ async def analyze(request: Request):
         logger.error("Step-4: Error occured while scrapping. Tries count = %d", count)
         retry_message = last_n_words(str(execution_result["output"]), 100)
         try:
-            response = await parse_question_with_llm(retry_message=retry_message, session_id=request_id, folder=request_folder)
+            # Pass schema info on retry as well
+            response = await parse_question_with_llm(retry_message=retry_message, session_id=request_id, folder=request_folder, db_schemas=db_schemas)
             with open(llm_response_file_path, "a") as f:
                     result = response
                     result["comment"] = f"Step-4: Error occured while scrapping. Tries count = %d, {count}"
@@ -177,35 +190,27 @@ async def analyze(request: Request):
             logger.error("Step-4: error occured while reading json. %s", last_n_words(e))
 
         logger.info("Step-3: Response from scrapping: %s", last_n_words(response))
-
         execution_result = await run_python_code(response["code"], response["libraries"], folder=request_folder)
-
         logger.info("Step-4: Execution result of the scrape code: %s", last_n_words(execution_result["output"]))
+        
         csv_path = os.path.join(request_folder, "data.csv")
         csv_retry_count = 0
         max_csv_retries = 3
-
         while os.path.exists(csv_path) and is_csv_empty(csv_path) and csv_retry_count < max_csv_retries:
             logger.warning("data.csv is present but empty. Retrying code generation and  execution. Attempt %d", csv_retry_count + 1)
-            response = await parse_question_with_llm(retry_message=str("There is no content present in scraped data files."), folder=request_folder, session_id=request_id)
+            response = await parse_question_with_llm(retry_message=str("There is no content present in scraped data files."), folder=request_folder, session_id=request_id, db_schemas=db_schemas)
             with open(llm_response_file_path, "a") as f:
                     result = response
                     result["comment"] = f"data.csv is present but empty. Retrying code generation and  execution. Attempt %d, {csv_retry_count + 1}"
                     json.dump(result, f, indent=4)
             execution_result = await run_python_code(response["code"], response["libraries"], folder=request_folder)
             csv_retry_count += 1
-
         count += 1
 
-    if execution_result["code"] == 1:
-        execution_result = execution_result["output"]
-    else:
+    if execution_result["code"] != 1:
         logger.error("error occured while scrapping.")
         return JSONResponse({"message": "error occured while scrapping."})
 
-    
-
-    # 6. get answers from llm
     max_attempts = 3
     attempt = 0
     gpt_ans = None
@@ -222,7 +227,6 @@ async def analyze(request: Request):
                     break
             else:
                 gpt_ans = await answer_with_data(retry_message=retry_message, folder=request_folder, session_id=request_id)
-
         except Exception as e:
             error_occured = 1
             logger.error("Step-5: Error: %s", e)
@@ -233,36 +237,29 @@ async def analyze(request: Request):
         logger.error("Error: Could not get valid response from answer_with_data after retries.")
         return JSONResponse({"message": "Error: Could not get valid response from answer_with_data after retries."})
     
-    # 7. Executing code
     try:
         logger.info("Step-6: Executing final code. Tries count = 0")
         final_result = await run_python_code(gpt_ans["code"], gpt_ans["libraries"], folder=request_folder)
         logger.info("Step-6: Executing final code result: %s", last_n_words(final_result["output"]))
     except Exception as e:
         logger.error("Step-6: Trying after it caught under except block-wrong json format. Tries count = 1 %s", last_n_words(e))
-        logger.info("Step-5: Getting execution code from llm. Tries count = %d", attempt+1)
         gpt_ans = await answer_with_data(retry_message=str("Please follow the json structure"), folder=request_folder, session_id=request_id)
         logger.info("Step-5: Response from llm: %s", last_n_words(gpt_ans["code"]))
         final_result = await run_python_code(gpt_ans["code"], gpt_ans["libraries"], folder=request_folder)
         logger.info("Step-6: Executing final code result: %s", last_n_words(final_result["output"]))
         
-
     count = 0
     json_str = 1
     while final_result["code"] == 0 and count < 3:
         logger.error("Step-6: Error occured while executing code. Tries count = %d", count+2)
         retry_message = last_n_words(str(final_result["output"]), 100)
-        
-        # If wrong json then retry msg change
         if json_str == 0:
             retry_message = "follow the structure {'code': '', 'libraries': ''}"
-
         logger.info("Step-5: Getting execution code from llm. Tries count = %d", attempt+1)
         try:
             gpt_ans = await answer_with_data(retry_message=retry_message,session_id=request_id, folder=request_folder)
             logger.info("Step-5: Response from llm: %s", last_n_words(gpt_ans["code"]))
         except Exception as e:
-            # Error came from gemini.py file due to wrong json response
             logger.error("Step-5: Json parsing error. %s", last_n_words(e))
             json_str = 0
         try:
@@ -272,33 +269,8 @@ async def analyze(request: Request):
         except Exception as e:
             logger.error("Exception occurred: %s", e)
             count -= 1
-
         count += 1
 
-    if final_result["code"] == 1:
-        final_result = final_result["output"]
-    else:
-        try:
-            # One last try - If result.json is empty
-            # Send request to llm to get metadata again
-            response = await parse_question_with_llm(
-                    question_text=question_text,
-                    uploaded_files=saved_files,
-                    folder=request_folder                    
-                )
-            # Execute the above generated code
-            execution_result = await run_python_code(response["code"], response["libraries"], folder=request_folder)
-            # get code with provided metadata
-            gpt_ans = await answer_with_data(question_text=response["questions"], folder=request_folder)
-            # Execute above generated code
-            final_result = await run_python_code(gpt_ans["code"], gpt_ans["libraries"], folder=request_folder)
-            # Return the generated json
-            result_path = os.path.join(request_folder, "result.json")
-            with open(result_path, "r") as f:
-                data = json.load(f)
-            return JSONResponse(content=data)
-        except Exception as e:
-            pass
     result_path = os.path.join(request_folder, "result.json")
     with open(result_path, "r") as f:
         try:
@@ -307,7 +279,6 @@ async def analyze(request: Request):
             return JSONResponse(content=data)
         except Exception as e:
             logger.error("Step-7: Error occur while sending result: %s", last_n_words(e))
-            # Return raw content if JSON parsing fails
             f.seek(0)
             raw_content = f.read()
             return JSONResponse({"message": f"Error occured while processing result.json: {e}", "raw_result": raw_content})
