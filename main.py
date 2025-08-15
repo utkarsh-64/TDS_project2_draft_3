@@ -1,8 +1,9 @@
-# main.py
+# main.py (fixed)
 import os
 import uuid
 import json
 import logging
+import asyncio
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, Request, UploadFile, File, Form
@@ -14,7 +15,7 @@ import aiofiles
 from pathlib import Path
 
 # ---- your modules (unchanged interface) ----
-# They can still call Gemini in any flexible way you’ve implemented.
+# They should keep the same function signatures used here.
 from gemini import parse_question_with_llm, answer_with_data
 from task_engine import run_python_code
 
@@ -23,7 +24,7 @@ app = FastAPI(title="Data Analyst Agent (Gemini-powered)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten if you have a specific FE domain
+    allow_origins=["*"],  # tighten for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -41,11 +42,13 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 FRONTEND_FILE = BASE_DIR / "frontend.html"
 
 # ---------------- Utilities ----------------
+
 def new_request_dir() -> Path:
     req_id = str(uuid.uuid4())
     req_dir = UPLOAD_DIR / req_id
     req_dir.mkdir(parents=True, exist_ok=True)
     return req_dir
+
 
 def setup_logger(req_dir: Path) -> logging.Logger:
     log_path = req_dir / "app.log"
@@ -66,6 +69,7 @@ def setup_logger(req_dir: Path) -> logging.Logger:
     logger.addHandler(sh)
     return logger
 
+
 async def save_upload(file: UploadFile, dest: Path) -> str:
     async with aiofiles.open(dest, "wb") as f:
         while True:
@@ -75,9 +79,11 @@ async def save_upload(file: UploadFile, dest: Path) -> str:
             await f.write(chunk)
     return str(dest)
 
+
 def last_n_words(s, n=100):
     s = str(s or "")
     return " ".join(s.split()[-n:])
+
 
 # ---------------- Routes ----------------
 @app.get("/", response_class=HTMLResponse)
@@ -89,17 +95,21 @@ async def root():
         status_code=200,
     )
 
+
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
+
 
 @app.get("/favicon.ico")
 async def favicon():
     return PlainTextResponse("", status_code=204)
 
+
 # ------------- Core endpoint --------------
 # Accept BOTH JSON and multipart in ONE route
 @app.post("/api")
+@app.post("/api/")
 async def api(
     request: Request,
     # Multipart fields (only used when Content-Type is multipart/form-data)
@@ -113,10 +123,7 @@ async def api(
     Flexible ingestion:
     - application/json:
         { "prompt": "...", "url": "...", "files": [{"name":"...", "b64":"..."}] }
-      (files optional; you can keep using your current Gemini logic)
-
-    - multipart/form-data:
-        fields: prompt_text, url, file, image, prompt_file
+    - multipart/form-data: fields: prompt_text, url, file, image, prompt_file
     """
     req_dir = new_request_dir()
     logger = setup_logger(req_dir)
@@ -173,6 +180,7 @@ async def api(
                         if not b64:
                             continue
                         import base64
+
                         dest = req_dir / name
                         async with aiofiles.open(dest, "wb") as f:
                             await f.write(base64.b64decode(b64))
@@ -186,29 +194,54 @@ async def api(
         logger.exception("Error parsing request: %s", e)
         return JSONResponse({"error": f"Failed to parse input: {e}"}, status_code=400)
 
-    prompt = prompt or ""
+    prompt = (prompt or "").strip()
     logger.info("Prompt (tail): %s", last_n_words(prompt))
+
+    # Validate prompt before calling Gemini
+    if not prompt and not saved_files:
+        logger.error("No prompt or files provided to process")
+        return JSONResponse({"error": "No prompt or files provided in the request."}, status_code=400)
 
     # ---------- LLM Planning (Gemini) ----------
     llm_response_file_path = req_dir / "llm_response.txt"
+
+    async def call_parse_with_retries(attempts: int = 3, backoff: float = 1.0):
+        last_exc = None
+        for i in range(attempts):
+            try:
+                logger.info("Calling parse_question_with_llm (attempt %d)", i + 1)
+                plan = await parse_question_with_llm(
+                    question_text=prompt,
+                    uploaded_files=saved_files,
+                    folder=str(req_dir),
+                    session_id=req_dir.name,
+                )
+                return plan
+            except Exception as e:
+                last_exc = e
+                logger.warning("parse_question_with_llm failed (attempt %d): %s", i + 1, last_n_words(e))
+                # quick backoff
+                await asyncio.sleep(backoff * (i + 1))
+        raise last_exc
+
     try:
-        plan = await parse_question_with_llm(
-            question_text=prompt,
-            uploaded_files=saved_files,  # pass dict of paths/urls; your gemini.py already knows how to use it
-            folder=str(req_dir),
-            session_id=req_dir.name,
-        )
+        plan = await call_parse_with_retries()
         if not isinstance(plan, dict):
             raise ValueError("parse_question_with_llm did not return dict")
         async with aiofiles.open(llm_response_file_path, "a", encoding="utf-8") as f:
             await f.write(json.dumps({"step": "plan", "plan": plan}, indent=2))
     except Exception as e:
         logger.exception("Gemini planning failed: %s", e)
+        # If the underlying error is from the Gemini client and mentions internal server error,
+        # provide a helpful message asking the caller to retry later.
+        msg = str(e)
+        if "InternalServerError" in msg or "internal error" in msg.lower():
+            return JSONResponse({"error": "Gemini planning failed: 500 internal error from model. Please retry later."}, status_code=502)
         return JSONResponse({"error": f"Gemini planning failed: {e}"}, status_code=500)
 
     # ---------- Execute code for data prep ----------
     try:
-        exec_result = await run_python_code(plan["code"], plan.get("libraries", []), folder=str(req_dir))
+        exec_result = await run_python_code(plan.get("code", ""), plan.get("libraries", []), folder=str(req_dir))
     except Exception as e:
         logger.exception("Executor failed (planning stage): %s", e)
         return JSONResponse({"error": f"Executor failed in planning stage: {e}"}, status_code=500)
@@ -219,21 +252,37 @@ async def api(
         return JSONResponse({"error": "Planning code execution failed", "detail": str(exec_result.get("output"))}, status_code=500)
 
     # ---------- Ask Gemini to generate final analysis code ----------
+    async def call_answer_with_retries(attempts: int = 3, backoff: float = 1.0):
+        last_exc = None
+        for i in range(attempts):
+            try:
+                logger.info("Calling answer_with_data (attempt %d)", i + 1)
+                analysis = await answer_with_data(
+                    question_text=plan.get("questions", prompt),
+                    folder=str(req_dir),
+                    session_id=req_dir.name,
+                )
+                return analysis
+            except Exception as e:
+                last_exc = e
+                logger.warning("answer_with_data failed (attempt %d): %s", i + 1, last_n_words(e))
+                await asyncio.sleep(backoff * (i + 1))
+        raise last_exc
+
     try:
-        analysis = await answer_with_data(
-            question_text=plan.get("questions", prompt),
-            folder=str(req_dir),
-            session_id=req_dir.name,
-        )
+        analysis = await call_answer_with_retries()
         if not isinstance(analysis, dict):
             raise ValueError("answer_with_data did not return dict")
     except Exception as e:
         logger.exception("Gemini analysis failed: %s", e)
+        msg = str(e)
+        if "InternalServerError" in msg or "internal error" in msg.lower():
+            return JSONResponse({"error": "Gemini analysis failed: 500 internal error from model. Please retry later."}, status_code=502)
         return JSONResponse({"error": f"Gemini analysis failed: {e}"}, status_code=500)
 
     # ---------- Execute final analysis code ----------
     try:
-        final_exec = await run_python_code(analysis["code"], analysis.get("libraries", []), folder=str(req_dir))
+        final_exec = await run_python_code(analysis.get("code", ""), analysis.get("libraries", []), folder=str(req_dir))
     except Exception as e:
         logger.exception("Executor failed (analysis stage): %s", e)
         return JSONResponse({"error": f"Executor failed in analysis stage: {e}"}, status_code=500)
@@ -274,6 +323,8 @@ async def api(
         background=BackgroundTask(cleanup, req_dir),
     )
 
+
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=bool(os.getenv("DEV", "")))
