@@ -10,8 +10,8 @@ if not api_key:
 
 genai.configure(api_key=api_key)
 
-# Changed to the requested flash model
-MODEL_NAME = "gemini-2.5-flash-latest" 
+# CORRECTED MODEL NAME
+MODEL_NAME = "gemini-1.5-flash-latest" 
 
 # Give response in JSON format
 generation_config = genai.types.GenerationConfig(
@@ -42,7 +42,6 @@ async def parse_question_with_llm(question_text=None, uploaded_files=None, db_sc
     Parse question with persistent chat session.
     - If retry_message is provided, sends only that to continue conversation.
     """
-    # Simplified prompt to prevent token limits and improve clarity
     SYSTEM_PROMPT = f"""
 You are a Python code generation assistant. Your task is to generate a JSON object containing Python code to scrape data, a list of required libraries, and the user's questions.
 
@@ -60,7 +59,6 @@ RULES:
     if retry_message:
         prompt = f"The previous code failed with this error: <error>{retry_message}</error>. Please generate a corrected JSON response. Pay close attention to the provided database schema if the error is SQL-related."
     else:
-        # Logic to include the database schema directly in the prompt
         db_schema_prompt_part = ""
         if db_schemas:
             db_schema_prompt_part = f'''
@@ -98,7 +96,6 @@ async def answer_with_data(question_text=None, session_id="default_answer", retr
     with open(metadata_path, "r") as file:
         metadata = file.read()
 
-    # Simplified prompt to prevent token limits and improve clarity
     SYSTEM_PROMPT = f"""
 You are a Python code generation assistant. Your task is to generate a JSON object containing Python code to analyze data and a list of required libraries.
 
