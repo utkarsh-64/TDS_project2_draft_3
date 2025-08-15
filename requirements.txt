@@ -3,5 +3,5 @@ aiofiles
 google-generativeai
 black
 uvicorn
-pyngrok
+gunicorn
 python-multipart
