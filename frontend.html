@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>FastAPI File Upload</title>
+  <style>
+    body { font-family: sans-serif; max-width: 600px; margin: 40px auto; }
+    pre { background: #f4f4f4; padding: 10px; }
+  </style>
+</head>
+<body>
+  <h2>Upload Files to FastAPI</h2>
+  <form id="uploadForm">
+    <input type="file" id="files" name="files" multiple>
+    <br><br>
+    <button type="submit">Submit</button>
+  </form>
+  <div style="margin-top:30px;">
+    <h3>Response:</h3>
+    <pre id="response">No response yet.</pre>
+  </div>
+  <script>
+    const form = document.getElementById('uploadForm');
+    const responseBox = document.getElementById('response');
+
+    form.addEventListener('submit', async function(e) {
+      e.preventDefault();
+      const filesInput = document.getElementById('files');
+      const formData = new FormData();
+      for (const file of filesInput.files) {
+        formData.append(file.name, file);
+      }
+      responseBox.textContent = "Uploading...";
+      try {
+        const res = await fetch('/api', {
+          method: 'POST',
+          body: formData
+        });
+        const data = await res.json();
+        responseBox.textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        responseBox.textContent = "Error in frontend: " + err;
+      }
+    });
+  </script>
+</body>
+</html>
