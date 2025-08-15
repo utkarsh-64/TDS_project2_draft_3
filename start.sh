@@ -1,9 +1,6 @@
 #!/bin/bash
 
-# This command starts the Gunicorn production server.
-# --timeout 120: Increases the worker timeout to 120 seconds to allow for long-running API calls.
-# -w 4: Specifies 4 worker processes to handle requests.
-# -k uvicorn.workers.UvicornWorker: Tells Gunicorn to use Uvicorn for running an ASGI app (FastAPI).
-# main:app: Points to the 'app' instance in your 'main.py' file.
-# -b 0.0.0.0:$PORT: Binds the server to the host and port provided by Render's environment.
-gunicorn --timeout 300 -w 4 -k uvicorn.workers.UvicornWorker main:app -b 0.0.0.0:$PORT
+# --preload: Loads application code before forking workers for better memory usage and stability.
+# --timeout 300: Sets a 5-minute timeout for workers.
+# -w 1: Uses a single worker to conserve memory on the free tier.
+gunicorn --preload --timeout 300 -w 1 -k uvicorn.workers.UvicornWorker main:app -b 0.0.0.0:$PORT
